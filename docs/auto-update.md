@@ -38,7 +38,7 @@ CI-published images, once per server:
 
 ```bash
 # 1. Drop the local image overrides (MINERU_SERVE_IMAGE=mineru:latest, ...)
-sed -i -E '/^(MINERU_SERVE|NOUGAT_SERVE|AUDIVERIS_SERVE|RAPID_LATEX_OCR|RAPIDOCR_ORIENT|PDF_UA_RENDER|VERAPDF_VALIDATE)_IMAGE=/d' .env
+sed -i -E '/^(MINERU_SERVE|NOUGAT_SERVE|AUDIVERIS_SERVE|RAPID_LATEX_OCR|PP_FORMULANET|RAPIDOCR_ORIENT|PDF_UA_RENDER|VERAPDF_VALIDATE)_IMAGE=/d' .env
 
 # 2. Pull the clone (new compose file) and start the sidecars from GHCR
 ./scripts/ops.sh track
@@ -141,6 +141,28 @@ Example output:
 2. Check the overview and logs: `./scripts/ops.sh auto-update status`
 3. Run manually: `./scripts/ops.sh auto-update start`
 4. Check if the image was published: `docker manifest inspect ghcr.io/a11ydevs/acessilia-toolbox:sha-<sha7>`
+
+### `The container name "/<id>_<name>" is already in use`
+
+`docker compose up` recreates a container by first creating the replacement as
+`<old-container-id[:12]>_<container_name>`, and only then stopping the old one
+and renaming the new one. If the update is interrupted in between (the MinerU
+image alone can take minutes to pull), the temporary container stays behind and
+the next `up` fails with that name conflict.
+
+`staging-update.sh` removes these leftovers for the toolbox and the sidecars it
+manages before every `up`, so a later run heals itself. To clear them by hand:
+
+```bash
+docker ps -a --format '{{.ID}} {{.Names}}' | grep -E '^[0-9a-f]{12}_'
+# inspect the list, then remove the containers that start with the id prefix:
+docker rm -f <container-id> [...]
+./scripts/ops.sh auto-update start
+```
+
+Two updates never run at the same time: the script takes a lock, so a manual
+`auto-update start` during the timer's run exits with
+`Another update is already running. Skipping.`
 
 ### docker compose not found
 

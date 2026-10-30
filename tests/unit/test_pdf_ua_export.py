@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -245,21 +247,26 @@ def test_cache_hit_reuses_the_stored_pdf_without_rendering(tmp_path: Path) -> No
     assert "%PDF" not in json.dumps(next(iter(cache.data.values())))
 
 
-def test_cache_hit_with_a_deleted_pdf_renders_again(tmp_path: Path) -> None:
+@pytest.mark.parametrize("artifact_index", [0, 1], ids=["json", "pdf"])
+def test_cache_hit_with_a_deleted_artifact_renders_again(
+    tmp_path: Path, artifact_index: int
+) -> None:
     handler, calls = sidecar()
     store = FilesystemArtifactStore(tmp_path)
     executor = executor_with(provider_with(handler), store=store, cache=MemoryCache())
 
     first = export(executor)
-    for stored in tmp_path.rglob("*"):
-        if stored.is_file():
-            stored.unlink()
+    store._path(first.artifacts[artifact_index].artifact_id).unlink()
     second = export(executor)
 
     assert not second.provenance.cache_hit
     assert sum(call.url.path == "/render" for call in calls) == 2
     assert store.get(second.document["artifact_id"]) == PDF_BYTES
     assert second.document["artifact_id"] == first.document["artifact_id"]
+    for artifact in second.artifacts:
+        payload, ref = executor.retrieve_artifact(artifact.artifact_id)
+        assert fingerprint_bytes(payload) == ref.artifact_id
+    assert export(executor).provenance.cache_hit
 
 
 def test_binary_outputs_require_an_artifact_store_before_rendering() -> None:
@@ -392,3 +399,80 @@ def test_template_defines_what_recent_pandoc_and_longtable_need() -> None:
     assert "\\newcounter{none}" in template
     assert "calc" in template
     assert "pdfstandard=ua-1" in template
+
+
+# ── Formula alternate text (filters/formula_alt.lua) ────────────────────
+
+
+def test_server_renders_through_the_formula_alt_filter(
+    server: Any, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "_missing_components", lambda: [])
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 43, b"", b"stop here")
+
+    monkeypatch.setattr(server.subprocess, "run", capture)
+    post_ast(client, AST_BYTES)
+
+    assert f"--lua-filter={server.FORMULA_ALT_FILTER_PATH}" in commands[0]
+
+
+def test_toolchain_reports_the_formula_alt_filter_digest(server: Any) -> None:
+    server.toolchain.cache_clear()
+    try:
+        digest = server.toolchain()["formula_alt_filter_sha256"]
+    finally:
+        server.toolchain.cache_clear()
+    assert digest == hashlib.sha256(server.FORMULA_ALT_FILTER_PATH.read_bytes()).hexdigest()
+
+
+def test_server_health_fails_without_the_formula_alt_filter(
+    server: Any, client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(server, "FORMULA_ALT_FILTER_PATH", tmp_path / "missing.lua")
+    monkeypatch.setattr(server.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert any("filter" in item for item in server._missing_components())
+
+
+def test_formula_alt_filter_drops_every_tex_special() -> None:
+    """The alternate text is the filter's only raw TeX: no special may survive."""
+    source = (SERVER_PATH.parent / "filters" / "formula_alt.lua").read_text(encoding="utf-8")
+    literal = re.search(r'TEX_SPECIALS = "(.*)"', source).group(1)
+    # Undo the Lua string escape (\\ -> \) and the pattern escape (%% -> %).
+    pattern_class = literal.replace("\\\\", "\\").replace("%%", "%")
+    for char in "\\{}$&#^_%~":
+        assert char in pattern_class, char
+
+
+def test_template_defines_the_formula_alt_command() -> None:
+    template = (SERVER_PATH.parent / "templates" / "pdf_ua.tex").read_text(encoding="utf-8")
+    assert "\\NewDocumentCommand \\AccessiliaFormulaAlt" in template
+    assert "\\l__math_content_template_tl" in template
+
+
+def test_smoke_check_reads_hex_and_literal_alternate_texts() -> None:
+    """The build-time /Alt check must not miss an /Alt the writer encodes differently."""
+    spec = importlib.util.spec_from_file_location(
+        "pdf_ua_smoke_check", SERVER_PATH.parent / "smoke_check.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    utf16 = "<FEFF" + "x pertence".encode("utf-16-be").hex().upper() + ">"
+    pdf = f"/Alt {utf16} /Alt (a \\(b\\) (c) \\101) /Alt <41424>".encode()
+
+    assert module.alternate_texts(pdf) == ["x pertence", "a (b) (c) A", "AB@"]
+    # A hex string the writer wraps across lines.
+    assert module.alternate_texts(b"/Alt <FEFF 0061\n 0062>") == ["ab"]
+    # UTF-16 little-endian, by its byte order mark.
+    assert module.alternate_texts(b"/Alt <FFFE6100>") == ["a"]
+    # Backslash-EOL continues the line; a bare EOL of any kind reads as LF.
+    assert module.alternate_texts(b"/Alt (a\\\nb) /Alt (c\\\r\nd) /Alt (e\r\nf\rg)") == [
+        "ab",
+        "cd",
+        "e\nf\ng",
+    ]
